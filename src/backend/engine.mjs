@@ -2,6 +2,7 @@ import * as RAPIER from '@dimforge/rapier3d-compat';
 import * as THREE from 'three';
 import fs from 'fs';
 import { resolve } from 'path';
+import zlib from 'zlib';
 
 let rapierReady = false;
 
@@ -10,11 +11,19 @@ let storedSnapshot = null;
 let storedMetadata = null;
 
 export async function storeSnapshot(snapshotBuffer, metadata) {
-  storedSnapshot = snapshotBuffer;
+  // If the incoming buffer is gzipped, decompress it for the in-memory store
+  if (snapshotBuffer[0] === 0x1f && snapshotBuffer[1] === 0x8b) {
+    storedSnapshot = zlib.gunzipSync(snapshotBuffer);
+    console.log(`[Engine] Decompressed received snapshot from ${snapshotBuffer.length} to ${storedSnapshot.length} bytes`);
+    fs.writeFileSync(resolve('..', 'track-snapshot.bin.gz'), snapshotBuffer);
+  } else {
+    storedSnapshot = snapshotBuffer;
+    fs.writeFileSync(resolve('..', 'track-snapshot.bin'), snapshotBuffer);
+  }
+  
   storedMetadata = metadata;
-  fs.writeFileSync(resolve('..', 'track-snapshot.bin'), snapshotBuffer);
   fs.writeFileSync(resolve('..', 'track-metadata.json'), JSON.stringify(metadata));
-  console.log(`[Engine] Snapshot stored: ${storedSnapshot.length} bytes, ${metadata.marbles?.length || 0} marbles`);
+  console.log(`[Engine] Snapshot stored in memory: ${storedSnapshot.length} bytes, ${metadata.marbles?.length || 0} marbles`);
 }
 
 export async function ensureInitialized() {
@@ -29,14 +38,20 @@ export async function ensureInitialized() {
 export async function autoInitialize() {
   await ensureInitialized();
   const snapshotPath = resolve('..', 'track-snapshot.bin');
+  const snapshotGzPath = resolve('..', 'track-snapshot.bin.gz');
   const metaPath = resolve('..', 'track-metadata.json');
   
-  if (fs.existsSync(snapshotPath) && fs.existsSync(metaPath)) {
+  if (fs.existsSync(snapshotGzPath) && fs.existsSync(metaPath)) {
+    const rawBuffer = fs.readFileSync(snapshotGzPath);
+    storedSnapshot = zlib.gunzipSync(rawBuffer);
+    storedMetadata = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+    console.log(`[Engine] Autonomous Init: Loaded and decompressed snapshot (${storedSnapshot.length} bytes) and metadata.`);
+  } else if (fs.existsSync(snapshotPath) && fs.existsSync(metaPath)) {
     storedSnapshot = fs.readFileSync(snapshotPath);
     storedMetadata = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
     console.log(`[Engine] Autonomous Init: Loaded snapshot (${storedSnapshot.length} bytes) and metadata.`);
   } else {
-    throw new Error('Static assets track-snapshot.bin or track-metadata.json missing.');
+    throw new Error('Static assets track-snapshot.bin(.gz) or track-metadata.json missing.');
   }
 }
 
@@ -63,8 +78,19 @@ const _tempQ = new THREE.Quaternion();
 const _tempVec = new THREE.Vector3();
 
 export async function* streamRace(seed) {
-  if (!rapierReady) await autoInitialize();
-  if (!storedSnapshot || !storedMetadata) await autoInitialize();
+  const _startTime = Date.now();
+  console.log(`[Engine] streamRace initiated at +0ms`);
+  
+  if (!rapierReady) {
+    console.log(`[Engine] autoInitialize (Rapier) starting...`);
+    await autoInitialize();
+    console.log(`[Engine] autoInitialize (Rapier) done at +${Date.now() - _startTime}ms`);
+  }
+  if (!storedSnapshot || !storedMetadata) {
+    console.log(`[Engine] autoInitialize (missing data) starting...`);
+    await autoInitialize();
+    console.log(`[Engine] autoInitialize (missing data) done at +${Date.now() - _startTime}ms`);
+  }
 
   const meta = storedMetadata;
   const seedNum = typeof seed === 'number' ? seed : (typeof seed === 'string' ? parseInt(seed, 10) : seed);
@@ -74,12 +100,17 @@ export async function* streamRace(seed) {
 
   for (let i = 0; i < 7; i++) marbleRandom();
 
+  console.log(`[Engine] Restoring Rapier snapshot at +${Date.now() - _startTime}ms...`);
+  const _restoreStart = Date.now();
   const physicsWorld = RAPIER.World.restoreSnapshot(storedSnapshot);
+  console.log(`[Engine] Restored Rapier snapshot in ${Date.now() - _restoreStart}ms`);
+  
   physicsWorld.gravity = { x: 0, y: -9.81 * 15.2, z: 0 };
   physicsWorld.timestep = PHYSICS_STEP;
 
   function getBody(handle) { return handle !== -1 ? physicsWorld.getRigidBody(handle) : null; }
 
+  console.log(`[Engine] Mapping bodies at +${Date.now() - _startTime}ms...`);
   const marbleBodies = meta.marbles.map(m => getBody(m.handle));
   const obstacleBodies = meta.obstacles.map(o => getBody(o.handle));
   const bladeBodies = meta.blades.map(b => getBody(b.handle));
@@ -95,14 +126,6 @@ export async function* streamRace(seed) {
   obstacleBodies.forEach(b => setRestitution(b, 0.1));
   bladeBodies.forEach(b => setRestitution(b, 0.12));
   setRestitution(gateBody, 0.05);
-  
-  // physicsWorld.forEachCollider(collider => {
-  //   const parent = collider.parent();
-  //   if (parent && parent.bodyType() === RAPIER.RigidBodyType.Fixed) {
-  //     collider.setRestitution(0.12);
-  //     collider.setFriction(0.2);
-  //   }
-  // });
 
   const obsState = meta.obstacles.map(() => ({
     timer: obstacleRandom() * 1.0 + 1.0,
@@ -125,6 +148,7 @@ export async function* streamRace(seed) {
   const stuckTimer = meta.marbles.map(() => 0);
   const kickCooldown = meta.marbles.map(() => 0);
 
+  console.log(`[Engine] Setup complete. Yielding 'start' chunk at +${Date.now() - _startTime}ms`);
   yield { type: 'start', seed: seedNum, physicsStep: PHYSICS_STEP };
 
   // ── Main simulation loop ──
@@ -343,8 +367,9 @@ export async function* streamRace(seed) {
     
     yield { type: 'frame', frame };
     
-    // Yield to event loop occasionally to avoid blocking the server entirely
-    if (physicsTick % 120 === 0) await new Promise(r => setTimeout(r, 0));
+    // Stream at 1.5x real-time speed (180 physics ticks per real second)
+    // Send a batch every 6 ticks (33ms) -> 30 batches/sec * 6 = 180 ticks/sec
+    if (physicsTick % 6 === 0) await new Promise(r => setTimeout(r, 33));
     
     let activeCount = 0;
     for (let i = 0; i < marbleBodies.length; i++) {

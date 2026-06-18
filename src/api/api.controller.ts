@@ -33,7 +33,8 @@ export class ApiController {
   @Post('precompute')
   async precompute(@Body() body: any, @Res() res: Response) {
     try {
-      console.log(`[API] Received POST /api/precompute`);
+      const startTime = Date.now();
+      console.log(`[API] Received POST /api/precompute at ${new Date().toISOString()}`);
       const { seed } = body;
       
       res.status(HttpStatus.OK).set({
@@ -41,13 +42,17 @@ export class ApiController {
         'Transfer-Encoding': 'chunked'
       });
 
+      console.log(`[API] Starting this.apiService.streamRace at +${Date.now() - startTime}ms`);
       let frameCount = 0;
       for await (const chunk of this.apiService.streamRace(seed)) {
+        if (frameCount === 0) {
+          console.log(`[API] First chunk (start) yielded at +${Date.now() - startTime}ms`);
+        }
         res.write(chunk);
         frameCount++;
-        if (frameCount % 1000 === 0) console.log(`[API] Streamed ${frameCount} frames...`);
+        if (frameCount % 1000 === 0) console.log(`[API] Streamed ${frameCount} frames... (+${Date.now() - startTime}ms)`);
       }
-      console.log(`[API] Stream completed. Total frames: ${frameCount}`);
+      console.log(`[API] Stream completed. Total frames: ${frameCount}. Total time: ${Date.now() - startTime}ms`);
       res.end();
     } catch (err: any) {
       console.error('[API] Error in /api/precompute:', err);
