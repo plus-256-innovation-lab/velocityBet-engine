@@ -6,7 +6,20 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
   app.enableCors({
-    origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://velocitybet-frontend-1084585965890.us-central1.run.app'],
+    origin: [
+      'http://localhost:5173',
+      'http://127.0.0.1:5173',
+      'http://localhost:5180',
+      'http://127.0.0.1:5180',
+      'http://localhost:5181',
+      'http://127.0.0.1:5181',
+      'https://localhost',
+      'http://localhost',
+      'capacitor://localhost',
+      'ionic://localhost',
+      'https://velocitybet-frontend-408537014080.us-central1.run.app',
+      'https://velocitybet-v1-408537014080.us-central1.run.app',
+    ],
     credentials: true,
     methods: 'OPTIONS, POST, GET',
     allowedHeaders: 'Content-Type, Authorization',
