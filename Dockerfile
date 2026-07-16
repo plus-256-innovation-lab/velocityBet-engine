@@ -37,7 +37,7 @@ COPY --from=builder /usr/src/app/dist ./dist
 # Copy the xgboost JSON models required at runtime, if any.
 # They are in the root directory
 COPY xgboost_model_winner_*.json ./
-COPY track-snapshot.bin track-metadata.json ./
+COPY track-snapshot.bin.gz track-metadata.json ./
 
 # Expose the default Cloud Run port (8080)
 EXPOSE 8080

@@ -39,8 +39,11 @@ export class ApiController {
       
       res.status(HttpStatus.OK).set({
         'Content-Type': 'application/json',
-        'Transfer-Encoding': 'chunked'
+        'Transfer-Encoding': 'chunked',
+        'Cache-Control': 'no-cache, no-transform',
+        'X-Accel-Buffering': 'no',
       });
+      res.flushHeaders();
 
       console.log(`[API] Starting this.apiService.streamRace at +${Date.now() - startTime}ms`);
       let frameCount = 0;
@@ -49,6 +52,7 @@ export class ApiController {
           console.log(`[API] First chunk (start) yielded at +${Date.now() - startTime}ms`);
         }
         res.write(chunk);
+        if (typeof (res as any).flush === 'function') (res as any).flush();
         frameCount++;
         if (frameCount % 1000 === 0) console.log(`[API] Streamed ${frameCount} frames... (+${Date.now() - startTime}ms)`);
       }

@@ -8,5 +8,8 @@ dist/
 *.log
 
 # Keep large runtime assets (gitignored but required for deploy)
-!track-snapshot.bin
 !track-snapshot.bin.gz
+
+# Training/dev artifacts not needed in the container (huge — slows uploads)
+track-snapshot.bin
+marble_race_data.csv

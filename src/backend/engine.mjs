@@ -6,24 +6,16 @@ import zlib from 'zlib';
 
 let rapierReady = false;
 
-// ── XGBoost Models ──
-let xgboostModels = [null, null, null, null];
+// ── XGBoost Model (1st place / race winner only) ──
+let xgboostWinnerModel = null;
 
 function loadXGBoostModels() {
-  const modelNames = [
-    'xgboost_model_winner_1.json',
-    'xgboost_model_winner_2.json',
-    'xgboost_model_winner_3.json',
-    'xgboost_model_winner_4.json',
-  ];
-  for (let i = 0; i < modelNames.length; i++) {
-    const modelPath = join(process.cwd(), modelNames[i]);
-    if (fs.existsSync(modelPath)) {
-      xgboostModels[i] = JSON.parse(fs.readFileSync(modelPath, 'utf-8'));
-      console.log(`[Engine] Loaded XGBoost model: ${modelNames[i]}`);
-    } else {
-      console.warn(`[Engine] XGBoost model not found: ${modelPath}`);
-    }
+  const modelPath = join(process.cwd(), 'xgboost_model_winner_1.json');
+  if (fs.existsSync(modelPath)) {
+    xgboostWinnerModel = JSON.parse(fs.readFileSync(modelPath, 'utf-8'));
+    console.log('[Engine] Loaded XGBoost model: xgboost_model_winner_1.json');
+  } else {
+    console.warn(`[Engine] XGBoost model not found: ${modelPath}`);
   }
 }
 
@@ -122,25 +114,17 @@ function buildPredictorFeatures(snapshotHistory, stepCount) {
 }
 
 function runPredictions(features) {
-  if (xgboostModels.some(m => m === null)) return null;
-  if (!features) return null;
+  if (!xgboostWinnerModel || !features) return null;
 
-  const results = [];
-  let currentFeatures = [...features];
+  const probs = evaluateXGBoost(features, xgboostWinnerModel);
+  const maxProb = Math.max(...probs);
+  const winnerId = probs.indexOf(maxProb);
 
-  for (let mIdx = 0; mIdx < 4; mIdx++) {
-    const probs = evaluateXGBoost(currentFeatures, xgboostModels[mIdx]);
-    const maxProb = Math.max(...probs);
-    const winnerId = probs.indexOf(maxProb);
-    results.push({
-      probabilities: probs,
-      confidence: maxProb,
-      winner_id: winnerId,
-    });
-    if (mIdx < 3) currentFeatures.push(winnerId);
-  }
-
-  return results;
+  return [{
+    probabilities: probs,
+    confidence: maxProb,
+    winner_id: winnerId,
+  }];
 }
 
 // ── In-memory store ──
@@ -163,7 +147,7 @@ export async function storeSnapshot(snapshotBuffer, metadata) {
   }
   
   storedMetadata = metadata;
-  fs.writeFileSync(resolve('track-metadata.json'), JSON.stringify(metadata));
+  fs.writeFileSync(resolve('track-metadata.json'), JSON.stringify(metadata, null, 2));
   console.log(`[Engine] Snapshot stored in memory: ${storedSnapshot.length} bytes, ${metadata.marbles?.length || 0} marbles`);
 
   // Invalidate warm world — new snapshot needs a fresh restore
@@ -181,7 +165,7 @@ export async function ensureInitialized() {
     rapierReady = true;
     console.log('[Engine] Rapier initialized');
   }
-  if (xgboostModels.every(m => m === null)) {
+  if (!xgboostWinnerModel) {
     loadXGBoostModels();
   }
 }
@@ -214,7 +198,17 @@ const OBSTACLE_SINK_DEPTH = 14;
 const OBSTACLE_SINK_TIME = 1.20;
 const OBSTACLE_HOLD_TIME = 0.28;
 const PHYSICS_STEP = 1 / 120;
+const PHYSICS_HZ = 120;
+// Client playback multiplier (engine streams as fast as physics computes — no wall-clock sleep).
+const STREAM_SPEED = 2.0;
+const KEYFRAME_INTERVAL = 1; // every physics tick streamed; client interpolates + display-gates
 const MARBLE_SETTLE_FRAMES = 90;
+// Authoritative race timeline (in physics ticks). The frontend derives the
+// 3-2-1-GO countdown and the gate opening from these so visuals match physics.
+const COUNTDOWN_START_TICK = 120;
+const COUNTDOWN_DURATION_TICKS = 420;
+const GATE_OPEN_TICK = COUNTDOWN_START_TICK + COUNTDOWN_DURATION_TICKS; // 540
+const IMPULSE_TICK = GATE_OPEN_TICK;
 
 function applyWorldDefaults(world) {
   world.gravity = { x: 0, y: -9.81 * 15.2, z: 0 };
@@ -270,6 +264,28 @@ const _bladeRotOffset = new THREE.Quaternion();
 const _tempQ = new THREE.Quaternion();
 const _tempVec = new THREE.Vector3();
 
+function resolveBodyHandle(handle) {
+  if (handle === -1 || handle == null) return -1;
+  if (typeof handle === 'string') return parseFloat(handle);
+  return handle;
+}
+
+/** Grid position slightly behind the gate hinge — matches frontend visual grid. */
+function marbleGridPos(m) {
+  const sp = m.startPos;
+  return { x: sp.x, y: sp.y, z: sp.z - 3.0 };
+}
+
+async function yieldFramePace() {
+  // No-op: the API pace-gate controls delivery timing.
+  // The engine produces frames as fast as possible into the API's buffer.
+}
+
+// Yield the event loop periodically to stay responsive to health checks etc.
+async function yieldEventLoop() {
+  await new Promise((r) => setImmediate(r));
+}
+
 export async function* streamRace(seed) {
   const _startTime = Date.now();
   console.log(`[Engine] streamRace initiated at +0ms`);
@@ -297,7 +313,10 @@ export async function* streamRace(seed) {
     console.log(`[Engine] Restored Rapier snapshot in ${Date.now() - _restoreStart}ms`);
   }
 
-  function getBody(handle) { return handle !== -1 ? physicsWorld.getRigidBody(handle) : null; }
+  function getBody(handle) {
+    const h = resolveBodyHandle(handle);
+    return h !== -1 ? physicsWorld.getRigidBody(h) : null;
+  }
 
   console.log(`[Engine] Mapping bodies at +${Date.now() - _startTime}ms...`);
   const marbleBodies = meta.marbles.map(m => getBody(m.handle));
@@ -345,7 +364,35 @@ export async function* streamRace(seed) {
   let lastPredictions = null;
 
   console.log(`[Engine] Setup complete. Yielding 'start' chunk at +${Date.now() - _startTime}ms`);
-  yield { type: 'start', seed: seedNum, physicsStep: PHYSICS_STEP };
+  yield {
+    type: 'start',
+    seed: seedNum,
+    physicsStep: PHYSICS_STEP,
+    physicsHz: PHYSICS_HZ,
+    keyframeInterval: KEYFRAME_INTERVAL,
+    countdownStartTick: COUNTDOWN_START_TICK,
+    gateOpenTick: GATE_OPEN_TICK,
+    impulseTick: IMPULSE_TICK,
+    streamSpeed: STREAM_SPEED,
+    marbleStarts: meta.marbles.map((m) => marbleGridPos(m)),
+  };
+
+  const buildFrame = (tick, gateOpen) => ({
+    tick,
+    marbles: meta.marbles.map((m, i) => {
+      const body = marbleBodies[i];
+      if (!body) return null;
+      const p = body.translation();
+      const r = body.rotation();
+      const v = body.linvel();
+      return [p.x, p.y, p.z, r.x, r.y, r.z, r.w, eliminated[i] ? 1 : 0, finished[i] ? 1 : 0, v.x, v.y, v.z];
+    }),
+    obstacles: meta.obstacles.map((obs, i) => { const body = obstacleBodies[i]; return body ? body.translation().y : 0; }),
+    blades: meta.blades.map((b, i) => { const body = bladeBodies[i]; if (!body) return [0, 0, 0, 1]; const r = body.rotation(); return [r.x, r.y, r.z, r.w]; }),
+    gateIsOpen: gateOpen,
+  });
+
+  yield { type: 'frame', frame: buildFrame(0, false) };
 
   // ── Main simulation loop ──
   const targetFinishedCount = 4;
@@ -362,6 +409,36 @@ export async function* streamRace(seed) {
     physicsTick++;
 
     physicsTimeTotal += PHYSICS_STEP;
+
+    if (!countdownStarted && !gateIsOpen && marbleBodies.length > 0) {
+      if (physicsTick === COUNTDOWN_START_TICK) {
+        countdownStarted = true;
+        gateOpenTick = GATE_OPEN_TICK;
+        impulseTick = IMPULSE_TICK;
+      }
+    }
+
+    if (physicsTick === gateOpenTick) {
+      gateIsOpen = true;
+      if (gateBody) {
+        gateBody.setNextKinematicTranslation({ x: 0, y: -1000, z: 0 });
+      }
+      for (let i = 0; i < marbleBodies.length; i++) {
+        const body = marbleBodies[i];
+        if (!body || eliminated[i]) continue;
+        const marbleR = meta.marbles[i]?.radius || 1;
+        const forwardImpulse = marbleR * 20.0;
+        const jitter = (marbleRandom() - 0.5) * marbleR * 3.0;
+        body.applyImpulse(
+          {
+            x: trackForwardDir.x * forwardImpulse + jitter,
+            y: 0,
+            z: trackForwardDir.z * forwardImpulse + jitter,
+          },
+          true,
+        );
+      }
+    }
 
     if (gateIsOpen) {
       for (let i = 0; i < meta.obstacles.length; i++) {
@@ -409,6 +486,17 @@ export async function* streamRace(seed) {
     }
 
     physicsWorld.step();
+
+    if (!gateIsOpen) {
+      for (let i = 0; i < marbleBodies.length; i++) {
+        const body = marbleBodies[i];
+        const grid = marbleGridPos(meta.marbles[i]);
+        if (!body || !grid || eliminated[i] || finished[i]) continue;
+        body.setTranslation(grid, true);
+        body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      }
+    }
 
     if (gateIsOpen && meta.bendBB) {
       for (let i = 0; i < marbleBodies.length; i++) {
@@ -482,39 +570,6 @@ export async function* streamRace(seed) {
       }
     }
 
-    if (!countdownStarted && !gateIsOpen && marbleBodies.length > 0) {
-      if (physicsTick === 120) {
-        countdownStarted = true;
-        gateOpenTick = physicsTick + 420;
-        impulseTick = gateOpenTick + 36;
-      }
-    }
-
-    if (physicsTick === gateOpenTick) {
-      gateIsOpen = true;
-      if (gateBody) {
-        gateBody.setNextKinematicTranslation({ x: 0, y: -1000, z: 0 });
-      }
-    }
-
-    if (physicsTick === impulseTick) {
-      for (let i = 0; i < marbleBodies.length; i++) {
-        const body = marbleBodies[i];
-        if (!body || eliminated[i]) continue;
-        const marbleR = meta.marbles[i]?.radius || 1;
-        const forwardImpulse = marbleR * 20.0;
-        const jitter = (marbleRandom() - 0.5) * marbleR * 3.0;
-        body.applyImpulse(
-          {
-            x: trackForwardDir.x * forwardImpulse + jitter,
-            y: 0,
-            z: trackForwardDir.z * forwardImpulse + jitter,
-          },
-          true
-        );
-      }
-    }
-
     for (let i = 0; i < marbleBodies.length; i++) {
       const body = marbleBodies[i];
       if (eliminated[i] || finished[i] || !body) continue;
@@ -548,45 +603,30 @@ export async function* streamRace(seed) {
       }
     }
 
-    const frame = {
-      marbles: meta.marbles.map((m, i) => {
-        const body = marbleBodies[i];
-        if (!body) return null;
-        const p = body.translation();
-        const r = body.rotation();
-        return [p.x, p.y, p.z, r.x, r.y, r.z, r.w, eliminated[i] ? 1 : 0, finished[i] ? 1 : 0];
-      }),
-      obstacles: meta.obstacles.map((obs, i) => { const body = obstacleBodies[i]; return body ? body.translation().y : 0; }),
-      blades: meta.blades.map((b, i) => { const body = bladeBodies[i]; if (!body) return [0, 0, 0, 1]; const r = body.rotation(); return [r.x, r.y, r.z, r.w]; }),
-      gateIsOpen: gateIsOpen
-    };
+    const frame = buildFrame(physicsTick, gateIsOpen);
 
-    // Attach last computed predictions to frame (computed below during yield idle)
-    if (lastPredictions) {
+    if (lastPredictions && physicsTick % 60 === 0) {
       frame.predictions = lastPredictions;
     }
-    
-    yield { type: 'frame', frame };
-    
-    // Stream at 3.0x real-time speed — during this idle window, compute predictions
-    // so they don't block the tight physics loop
-    if (physicsTick % 12 === 0) {
-      // Capture snapshot and run predictions during yield idle (non-blocking)
-      if (gateIsOpen && physicsTick % 60 === 0) {
-        const snapFrame = meta.marbles.map((m, i) => {
-          const body = marbleBodies[i];
-          if (!body || eliminated[i] || finished[i]) return { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
-          const p = body.translation();
-          const v = body.linvel();
-          return { x: p.x, y: p.y, z: p.z, vx: v.x, vy: v.y, vz: v.z };
-        });
-        predictionHistory.push(snapFrame);
-        if (predictionHistory.length > 15) predictionHistory.shift();
 
-        const features = buildPredictorFeatures(predictionHistory, physicsTick);
-        lastPredictions = runPredictions(features);
-      }
-      await new Promise(r => setTimeout(r, 33));
+    yield { type: 'frame', frame };
+
+    // Yield event loop every 60 frames (~0.5s of sim time) to stay responsive.
+    if (physicsTick % 60 === 0) await yieldEventLoop();
+
+    if (gateIsOpen && physicsTick % 60 === 0) {
+      const snapFrame = meta.marbles.map((m, i) => {
+        const body = marbleBodies[i];
+        if (!body || eliminated[i] || finished[i]) return { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
+        const p = body.translation();
+        const v = body.linvel();
+        return { x: p.x, y: p.y, z: p.z, vx: v.x, vy: v.y, vz: v.z };
+      });
+      predictionHistory.push(snapFrame);
+      if (predictionHistory.length > 15) predictionHistory.shift();
+
+      const features = buildPredictorFeatures(predictionHistory, physicsTick);
+      lastPredictions = runPredictions(features);
     }
     
     let activeCount = 0;
