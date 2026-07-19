@@ -34,10 +34,12 @@ RUN npm ci --only=production
 # Copy built files from the builder stage
 COPY --from=builder /usr/src/app/dist ./dist
 
-# Copy the xgboost JSON models required at runtime, if any.
-# They are in the root directory
+# Copy the xgboost JSON models + meta required at runtime
+COPY xgboost_model_winner.json ./
 COPY xgboost_model_winner_*.json ./
+COPY model_meta.json ./
 COPY track-snapshot.bin.gz track-metadata.json ./
+COPY track-centerline.json ./
 
 # Expose the default Cloud Run port (8080)
 EXPOSE 8080

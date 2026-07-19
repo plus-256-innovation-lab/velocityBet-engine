@@ -7,8 +7,12 @@ import zlib from 'zlib';
 // ── Constants ──
 const PHYSICS_STEP = 1 / 120;
 const OBSTACLE_SINK_DEPTH = 14;
-const OBSTACLE_SINK_TIME = 1.20;
-const OBSTACLE_HOLD_TIME = 0.28;
+const OBSTACLE_SINK_TIME = 2.0;
+const OBSTACLE_RISE_TIME = 2.0;
+const OBSTACLE_HOLD_TIME = 0.25;
+const OBSTACLE_WAIT_TIME = 0.25;
+const OBSTACLE_HOLD_TIME_LONG = 2.5;
+const OBSTACLE_WAIT_TIME_LONG = 4.0;
 const SAMPLE_INTERVAL = 30;
 const MARBLE_NAMES = ['Yellow', 'White', 'Cyan', 'Green', 'Red', 'Blue', 'Orange', 'Purple'];
 
@@ -76,10 +80,39 @@ function runRace(metadata, seed) {
   bladeBodies.forEach(b => { if (b) b.collider(0).setRestitution(0.12); });
   if (gateBody) gateBody.collider(0).setRestitution(0.05);
 
-  const obsState = meta.obstacles.map(() => ({
-    timer: obstacleRandom() * 1.0 + 1.0,
-    state: 'waiting',
-  }));
+  function obstacleInBB(oMeta, bb, yPad = 0) {
+    if (!bb?.min || !bb?.max || !oMeta) return false;
+    return (
+      oMeta.wx >= bb.min.x && oMeta.wx <= bb.max.x &&
+      oMeta.bodyWy >= bb.min.y - yPad && oMeta.bodyWy <= bb.max.y + yPad &&
+      oMeta.wz >= bb.min.z && oMeta.wz <= bb.max.z
+    );
+  }
+  function isLongStayObstacle(oMeta) {
+    return (
+      obstacleInBB(oMeta, meta.finishPlaneBB, 25) ||
+      obstacleInBB(oMeta, meta.lastRunBB, 10)
+    );
+  }
+  function obstacleWaitTime(oMeta) {
+    return isLongStayObstacle(oMeta) ? OBSTACLE_WAIT_TIME_LONG : OBSTACLE_WAIT_TIME;
+  }
+  function obstacleHoldTime(oMeta) {
+    return isLongStayObstacle(oMeta) ? OBSTACLE_HOLD_TIME_LONG : OBSTACLE_HOLD_TIME;
+  }
+
+  const obsState = meta.obstacles.map((oMeta) => {
+    const rnd = obstacleRandom();
+    const waitT = obstacleWaitTime(oMeta);
+    const holdT = obstacleHoldTime(oMeta);
+    let state = 'waiting';
+    let timer = 0;
+    if (rnd < 0.25) { state = 'waiting'; timer = obstacleRandom() * waitT; }
+    else if (rnd < 0.5) { state = 'sinking'; timer = obstacleRandom() * OBSTACLE_SINK_TIME; }
+    else if (rnd < 0.75) { state = 'sunk'; timer = obstacleRandom() * holdT; }
+    else { state = 'rising'; timer = obstacleRandom() * OBSTACLE_RISE_TIME; }
+    return { timer, state };
+  });
   const trackForwardDir = new THREE.Vector3(meta.trackForwardDir.x, meta.trackForwardDir.y, meta.trackForwardDir.z);
 
   let physicsTick = 0;
@@ -112,23 +145,25 @@ function runRace(metadata, seed) {
       for (let i = 0; i < meta.obstacles.length; i++) {
         const obs = obsState[i];
         const body = obstacleBodies[i];
-        if (!body) continue;
+        const oMeta = meta.obstacles[i];
+        if (!body || !oMeta) continue;
         obs.timer -= PHYSICS_STEP;
         let sinkFrac = 0;
         switch (obs.state) {
           case 'waiting': if (obs.timer <= 0) { obs.state = 'sinking'; obs.timer = OBSTACLE_SINK_TIME; } break;
-          case 'sinking': sinkFrac = 1 - obs.timer / OBSTACLE_SINK_TIME; if (obs.timer <= 0) { obs.state = 'sunk'; obs.timer = OBSTACLE_HOLD_TIME; sinkFrac = 1; } break;
-          case 'sunk': sinkFrac = 1; if (obs.timer <= 0) { obs.state = 'rising'; obs.timer = OBSTACLE_SINK_TIME; } break;
-          case 'rising': sinkFrac = obs.timer / OBSTACLE_SINK_TIME; if (obs.timer <= 0) { obs.state = 'waiting'; obs.timer = obstacleRandom() * 1.0 + 1.0; sinkFrac = 0; } break;
+          case 'sinking': sinkFrac = 1 - obs.timer / OBSTACLE_SINK_TIME; if (obs.timer <= 0) { obs.state = 'sunk'; obs.timer = obstacleHoldTime(oMeta); sinkFrac = 1; } break;
+          case 'sunk': sinkFrac = 1; if (obs.timer <= 0) { obs.state = 'rising'; obs.timer = OBSTACLE_RISE_TIME; } break;
+          case 'rising': sinkFrac = obs.timer / OBSTACLE_RISE_TIME; if (obs.timer <= 0) { obs.state = 'waiting'; obs.timer = obstacleWaitTime(oMeta); sinkFrac = 0; } break;
         }
         const s = sinkFrac * sinkFrac * (3 - 2 * sinkFrac);
-        body.setNextKinematicTranslation({ x: meta.obstacles[i].wx, y: meta.obstacles[i].bodyWy - s * OBSTACLE_SINK_DEPTH, z: meta.obstacles[i].wz });
+        body.setNextKinematicTranslation({ x: oMeta.wx, y: oMeta.bodyWy - s * OBSTACLE_SINK_DEPTH, z: oMeta.wz });
       }
       for (let i = 0; i < meta.blades.length; i++) {
         const blade = meta.blades[i];
         const body = bladeBodies[i];
         if (!body || !blade.baseQuat) continue;
-        _bladeRotOffset.setFromAxisAngle(_bladeAxis, physicsTimeTotal);
+        const randomPhase = blade.mesh ? (blade.mesh.id % 10) * 1.2 : i * 1.5;
+        _bladeRotOffset.setFromAxisAngle(_bladeAxis, physicsTimeTotal + randomPhase);
         _tempQ.set(blade.baseQuat.x, blade.baseQuat.y, blade.baseQuat.z, blade.baseQuat.w).multiply(_bladeRotOffset);
         body.setNextKinematicRotation({ x: _tempQ.x, y: _tempQ.y, z: _tempQ.z, w: _tempQ.w });
       }

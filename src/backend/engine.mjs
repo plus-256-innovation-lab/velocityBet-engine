@@ -6,26 +6,187 @@ import zlib from 'zlib';
 
 let rapierReady = false;
 
-// ── XGBoost Model (1st place / race winner only) ──
+// ── XGBoost Model (1st place / race winner only) — aligned with training v4 ──
+// Training notebook: VelocityBet marble-race XGBoost multi:softprob on 30-tick
+// snapshots with 247 features. See model_meta.json next to the booster file.
 let xgboostWinnerModel = null;
+let xgboostModelMeta = null;
+/** Averaged winner path: { points:[{x,y,z,progress,arcLength}], totalArcLength }. */
+let trackCenterline = null;
+
+/** Feature / CSV marble order from training (Red == live Black marble). */
+const MODEL_FEATURE_MARBLES = [
+  'Yellow', 'White', 'Cyan', 'Green', 'Red', 'Blue', 'Orange', 'Purple',
+];
+/** Class index order = sorted(winner unique) from training label_map. */
+const MODEL_CLASS_ORDER = [
+  'Blue', 'Cyan', 'Green', 'Orange', 'Purple', 'Red', 'White', 'Yellow',
+];
+/** Live stream / betting marbleIndex order (frontend RACE_MARBLE_COLORS). */
+const LIVE_MARBLE_ORDER = [
+  'Green', 'Blue', 'Yellow', 'White', 'Cyan', 'Purple', 'Orange', 'Black',
+];
+const LIVE_TO_MODEL_NAME = { Black: 'Red' };
+const PHYSICS_HZ_PRED = 120;
+const RACE_DURATION_SEC_PRED = 45.0;
+const PRED_SAMPLE_INTERVAL = 30; // matches collect_data SAMPLE_INTERVAL
+const PRED_HISTORY_LEN = 16;     // need ≥10 for roll10 and ≥4 for delta3
 
 function loadXGBoostModels() {
-  const modelPath = join(process.cwd(), 'xgboost_model_winner_1.json');
-  if (fs.existsSync(modelPath)) {
-    xgboostWinnerModel = JSON.parse(fs.readFileSync(modelPath, 'utf-8'));
-    console.log('[Engine] Loaded XGBoost model: xgboost_model_winner_1.json');
-  } else {
-    console.warn(`[Engine] XGBoost model not found: ${modelPath}`);
+  const candidates = [
+    join(process.cwd(), 'xgboost_model_winner.json'),
+    join(process.cwd(), 'xgboost_model_winner_v4.json'),
+    join(process.cwd(), 'xgboost_model_winner_1.json'),
+  ];
+  const modelPath = candidates.find((p) => fs.existsSync(p));
+  if (!modelPath) {
+    console.warn('[Engine] XGBoost model not found. Tried:', candidates.map((p) => p.split(/[/\\]/).pop()).join(', '));
+    return;
+  }
+  xgboostWinnerModel = JSON.parse(fs.readFileSync(modelPath, 'utf-8'));
+  const nFeat = Number(xgboostWinnerModel?.learner?.learner_model_param?.num_feature || 0);
+  const featNames = xgboostWinnerModel?.learner?.feature_names;
+  console.log(`[Engine] Loaded XGBoost model: ${modelPath.split(/[/\\]/).pop()} (num_feature=${nFeat || featNames?.length || '?'})`);
+
+  const metaPath = join(process.cwd(), 'model_meta.json');
+  if (fs.existsSync(metaPath)) {
+    try {
+      xgboostModelMeta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+      console.log(`[Engine] Loaded model_meta.json (${xgboostModelMeta.n_features || '?'} features)`);
+    } catch (err) {
+      console.warn('[Engine] Failed to parse model_meta.json', err);
+    }
+  }
+
+  if (Array.isArray(featNames) && featNames.length && featNames.length !== 247) {
+    console.warn(`[Engine] Expected 247 v4 features, model has ${featNames.length}`);
   }
 }
 
+function loadTrackCenterline() {
+  const candidates = [
+    join(process.cwd(), 'track-centerline.json'),
+    resolve('track-centerline.json'),
+  ];
+  const path = candidates.find((p) => fs.existsSync(p));
+  if (!path) {
+    console.warn('[Engine] track-centerline.json not found — progress evidence falls back to −Y');
+    trackCenterline = null;
+    return;
+  }
+  try {
+    const raw = JSON.parse(fs.readFileSync(path, 'utf-8'));
+    const points = Array.isArray(raw.points) ? raw.points : [];
+    if (points.length < 2) {
+      console.warn('[Engine] track-centerline.json has too few points');
+      trackCenterline = null;
+      return;
+    }
+    trackCenterline = {
+      points,
+      totalArcLength: Number(raw.totalArcLength) || points[points.length - 1]?.arcLength || 1,
+    };
+    console.log(
+      `[Engine] Loaded centerline: ${path.split(/[/\\]/).pop()} (${points.length} pts, arc=${trackCenterline.totalArcLength.toFixed(1)})`,
+    );
+  } catch (err) {
+    console.warn('[Engine] Failed to load track-centerline.json', err);
+    trackCenterline = null;
+  }
+}
+
+/**
+ * Project a world position onto the centerline polyline.
+ * hintProgress (previous estimate) windows the search so hairpins/loops
+ * don't snap a marble onto a distant overlapping segment.
+ */
+function projectOntoCenterline(x, y, z, hintProgress = null) {
+  const pts = trackCenterline?.points;
+  if (!pts || pts.length < 2) {
+    const approx = Math.max(0, Math.min(1, (1200 - y) / 1200));
+    return { progress: approx, arcLength: approx * 6000, dist: 0 };
+  }
+
+  let iStart = 0;
+  let iEnd = pts.length - 2;
+  if (hintProgress != null && Number.isFinite(hintProgress)) {
+    const lo = Math.max(0, hintProgress - 0.04);
+    const hi = Math.min(1, hintProgress + 0.20);
+    while (iStart < iEnd && pts[iStart + 1].progress < lo) iStart++;
+    while (iEnd > iStart && pts[iEnd].progress > hi) iEnd--;
+  }
+
+  let bestD2 = Infinity;
+  let bestArc = 0;
+  let bestProg = hintProgress ?? 0;
+
+  for (let i = iStart; i <= iEnd; i++) {
+    const a = pts[i];
+    const b = pts[i + 1];
+    const abx = b.x - a.x;
+    const aby = b.y - a.y;
+    const abz = b.z - a.z;
+    const apx = x - a.x;
+    const apy = y - a.y;
+    const apz = z - a.z;
+    const abLen2 = abx * abx + aby * aby + abz * abz;
+    let t = abLen2 > 1e-12 ? (apx * abx + apy * aby + apz * abz) / abLen2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    const cx = a.x + t * abx;
+    const cy = a.y + t * aby;
+    const cz = a.z + t * abz;
+    const dx = x - cx;
+    const dy = y - cy;
+    const dz = z - cz;
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 < bestD2) {
+      bestD2 = d2;
+      bestArc = a.arcLength + t * (b.arcLength - a.arcLength);
+      bestProg = a.progress + t * (b.progress - a.progress);
+    }
+  }
+
+  let progress = Math.max(0, Math.min(1, bestProg));
+  // Mostly monotonic — allow tiny noise, reject big regressions from bad snaps.
+  if (hintProgress != null && Number.isFinite(hintProgress)) {
+    if (progress < hintProgress - 0.03) progress = hintProgress;
+    else if (progress < hintProgress) progress = hintProgress * 0.85 + progress * 0.15;
+  }
+
+  return {
+    progress,
+    arcLength: bestArc,
+    dist: Math.sqrt(bestD2),
+  };
+}
+
+function parseBaseScores(model, numClasses) {
+  const raw = model?.learner?.learner_model_param?.base_score;
+  const logits = new Array(numClasses).fill(0);
+  if (raw == null) return logits;
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (Array.isArray(parsed)) {
+      for (let i = 0; i < numClasses; i++) logits[i] = Number(parsed[i]) || 0;
+      return logits;
+    }
+    const single = Number(parsed);
+    if (Number.isFinite(single)) return logits.map(() => single);
+  } catch {
+    const single = Number(raw);
+    if (Number.isFinite(single)) return logits.map(() => single);
+  }
+  return logits;
+}
+
 function evaluateXGBoost(features, model) {
-  if (!model || !model.learner) return [0, 0, 0, 0, 0, 0, 0, 0];
+  if (!model || !model.learner) return new Array(MODEL_CLASS_ORDER.length).fill(1 / MODEL_CLASS_ORDER.length);
   const booster = model.learner.gradient_booster.model;
   const trees = booster.trees;
   const treeInfo = booster.tree_info;
-  const numClasses = 8;
-  const logits = new Array(numClasses).fill(0);
+  const numClasses = Number(model.learner.learner_model_param?.num_class) || MODEL_CLASS_ORDER.length;
+  // v4 booster has boost_from_average + per-class base_score — must seed logits.
+  const logits = parseBaseScores(model, numClasses);
 
   for (let i = 0; i < trees.length; i++) {
     const classId = treeInfo[i];
@@ -46,77 +207,260 @@ function evaluateXGBoost(features, model) {
 
   let maxLogit = -Infinity;
   for (let i = 0; i < numClasses; i++) if (logits[i] > maxLogit) maxLogit = logits[i];
-  const exps = logits.map(l => Math.exp(l - maxLogit));
-  const sumExp = exps.reduce((a, b) => a + b, 0);
-  return exps.map(e => e / sumExp);
+  const exps = logits.map((l) => Math.exp(l - maxLogit));
+  const sumExp = exps.reduce((a, b) => a + b, 0) || 1;
+  return exps.map((e) => e / sumExp);
 }
 
-function buildPredictorFeatures(snapshotHistory, stepCount) {
-  if (snapshotHistory.length < 1) return null;
+function emptyState() {
+  return { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
+}
 
-  const current = snapshotHistory[snapshotHistory.length - 1];
-  const prev = snapshotHistory.length > 1 ? snapshotHistory[snapshotHistory.length - 2] : current;
+function liveIndexForModelMarble(modelName) {
+  const liveName = modelName === 'Red' ? 'Black' : modelName;
+  const idx = LIVE_MARBLE_ORDER.indexOf(liveName);
+  return idx >= 0 ? idx : -1;
+}
+
+function stateAt(history, liveIdx, histOffsetFromEnd = 0) {
+  const snap = history[history.length - 1 - histOffsetFromEnd];
+  if (!snap || liveIdx < 0) return emptyState();
+  return snap[liveIdx] || emptyState();
+}
+
+function speedOf(m) {
+  return Math.sqrt(m.vx * m.vx + m.vy * m.vy + m.vz * m.vz);
+}
+
+/** Pandas-like rank; ties get average ranks. higherBetter=false → lower values rank 1. */
+function rankAxis(values, higherBetter) {
+  const n = values.length;
+  const order = values
+    .map((v, i) => ({ v, i }))
+    .sort((a, b) => (higherBetter ? b.v - a.v : a.v - b.v));
+  const ranks = new Array(n).fill(0);
+  let i = 0;
+  while (i < n) {
+    let j = i;
+    while (j + 1 < n && order[j + 1].v === order[i].v) j++;
+    const avgRank = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[order[k].i] = avgRank;
+    i = j + 1;
+  }
+  return ranks;
+}
+
+/**
+ * Build the exact 247-feature vector used by training v4, in model feature_names order.
+ * history = array of snapshot frames in LIVE marble index order.
+ */
+function buildPredictorFeatures(snapshotHistory, stepCount, raceStartTick = 0) {
+  if (!snapshotHistory.length) return null;
+
+  const H = snapshotHistory.length;
+  const current = snapshotHistory[H - 1];
+  const prev = H > 1 ? snapshotHistory[H - 2] : current;
+  const snap3 = H > 3 ? snapshotHistory[H - 4] : current; // diff(3) → 3 steps back
+
+  // Per-model-marble live indices + states
+  const liveIdxs = MODEL_FEATURE_MARBLES.map(liveIndexForModelMarble);
+  const now = liveIdxs.map((li) => (li >= 0 ? current[li] || emptyState() : emptyState()));
+  const was = liveIdxs.map((li) => (li >= 0 ? (prev[li] || emptyState()) : emptyState()));
+  const ago3 = liveIdxs.map((li) => (li >= 0 ? (snap3[li] || emptyState()) : emptyState()));
+  const speeds = now.map(speedOf);
+
   const features = [];
 
-  // 1. Raw positions/velocities (8 * 6 = 48)
+  // 1. Raw x,y,z,vx,vy,vz (8×6 = 48)
   for (let i = 0; i < 8; i++) {
-    const m = current[i] || { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
+    const m = now[i];
     features.push(m.x, m.y, m.z, m.vx, m.vy, m.vz);
   }
 
-  // 2. Engineered features (8 * 8 = 64)
+  // 2. Per-marble kinematics (8×11 = 88): speed, dv*, speed_roll5, *_roll10, d*_3
   for (let i = 0; i < 8; i++) {
-    const mNow = current[i] || { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
-    const mPrev = prev[i] || { vx: 0, vy: 0, vz: 0 };
+    const mNow = now[i];
+    const mPrev = was[i];
+    const m3 = ago3[i];
+    const li = liveIdxs[i];
+
+    features.push(speeds[i]);
     features.push(mNow.vx - mPrev.vx, mNow.vy - mPrev.vy, mNow.vz - mPrev.vz);
-    const speedNow = Math.sqrt(mNow.vx * mNow.vx + mNow.vy * mNow.vy + mNow.vz * mNow.vz);
-    features.push(speedNow);
+
     let speedSum5 = 0;
-    const count5 = Math.min(5, snapshotHistory.length);
+    const count5 = Math.min(5, H);
     for (let h = 0; h < count5; h++) {
-      const snap = snapshotHistory[snapshotHistory.length - 1 - h];
-      const m = snap[i] || { vx: 0, vy: 0, vz: 0 };
-      speedSum5 += Math.sqrt(m.vx * m.vx + m.vy * m.vy + m.vz * m.vz);
+      speedSum5 += speedOf(stateAt(snapshotHistory, li, h));
     }
     features.push(speedSum5 / count5);
-    let xSum10 = 0, ySum10 = 0, zSum10 = 0;
-    const count10 = Math.min(10, snapshotHistory.length);
+
+    let xSum10 = 0;
+    let ySum10 = 0;
+    let zSum10 = 0;
+    const count10 = Math.min(10, H);
     for (let h = 0; h < count10; h++) {
-      const snap = snapshotHistory[snapshotHistory.length - 1 - h];
-      const m = snap[i] || { x: 0, y: 0, z: 0 };
+      const m = stateAt(snapshotHistory, li, h);
       xSum10 += m.x;
       ySum10 += m.y;
       zSum10 += m.z;
     }
     features.push(xSum10 / count10, ySum10 / count10, zSum10 / count10);
+
+    features.push(mNow.x - m3.x, mNow.y - m3.y, mNow.z - m3.z);
   }
 
-  // 3. Pairwise Distances (28)
+  // 3. Ranks & gaps (8×7 = 56) — need previous z/y ranks for delta3
+  const yRanks = rankAxis(now.map((m) => m.y), false); // lower y → rank 1
+  const zRanks = rankAxis(now.map((m) => m.z), true);  // higher z → rank 1
+  const speedRanks = rankAxis(speeds, true);
+  const leaderY = Math.min(...now.map((m) => m.y));
+  const leaderZ = Math.max(...now.map((m) => m.z));
+
+  const ago3States = liveIdxs.map((li) => stateAt(snapshotHistory, li, Math.min(3, H - 1)));
+  const yRanks3 = rankAxis(ago3States.map((m) => m.y), false);
+  const zRanks3 = rankAxis(ago3States.map((m) => m.z), true);
+
+  for (let i = 0; i < 8; i++) {
+    features.push(yRanks[i]);
+    features.push(now[i].y - leaderY);
+    features.push(zRanks[i]);
+    features.push(leaderZ - now[i].z);
+    features.push(speedRanks[i]);
+    features.push(zRanks[i] - zRanks3[i]);
+    features.push(yRanks[i] - yRanks3[i]);
+  }
+
+  // 4. Pairwise 3D distances (28)
   for (let i = 0; i < 8; i++) {
     for (let j = i + 1; j < 8; j++) {
-      const mi = current[i] || { x: 0, y: 0, z: 0 };
-      const mj = current[j] || { x: 0, y: 0, z: 0 };
-      features.push(Math.sqrt((mi.x - mj.x) ** 2 + (mi.y - mj.y) ** 2 + (mi.z - mj.z) ** 2));
+      const a = now[i];
+      const b = now[j];
+      features.push(Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2));
     }
   }
 
-  // 4. Ranks (8)
-  const zPos = [0, 1, 2, 3, 4, 5, 6, 7].map(i => ({ i, z: current[i] ? current[i].z : -1000 }));
-  zPos.sort((a, b) => b.z - a.z);
-  const ranks = new Array(8);
-  zPos.forEach((item, index) => { ranks[item.i] = index + 1; });
-  features.push(...ranks);
+  // 5. Race progress (3)
+  const raceProgressEngine = Math.min(
+    1.0,
+    (stepCount * (1 / PHYSICS_HZ_PRED)) / RACE_DURATION_SEC_PRED,
+  );
+  // Live races don't know finish tick — approximate within-race progress with engine formula.
+  const raceProgress = raceProgressEngine;
+  const ticksSinceStart = Math.max(0, stepCount - raceStartTick);
+  features.push(raceProgressEngine, raceProgress, ticksSinceStart);
 
-  // 5. Race Progress (1)
-  features.push(Math.min(1.0, (stepCount * (1 / 120)) / 45.0));
+  // 6. Progress interactions (8×3 = 24)
+  const early = 1.0 - raceProgress;
+  for (let i = 0; i < 8; i++) {
+    features.push(zRanks[i] * raceProgress);
+    features.push((leaderZ - now[i].z) * early);
+    features.push(speeds[i] * early);
+  }
 
   return features;
+}
+
+/** Remap model class-order softmax → live marbleIndex probabilities. */
+function probsToLiveOrder(classProbs) {
+  const live = new Array(LIVE_MARBLE_ORDER.length).fill(0);
+  for (let liveIdx = 0; liveIdx < LIVE_MARBLE_ORDER.length; liveIdx++) {
+    const liveName = LIVE_MARBLE_ORDER[liveIdx];
+    const modelName = LIVE_TO_MODEL_NAME[liveName] || liveName;
+    const classIdx = MODEL_CLASS_ORDER.indexOf(modelName);
+    live[liveIdx] = classIdx >= 0 ? classProbs[classIdx] ?? 0 : 0;
+  }
+  const sum = live.reduce((a, b) => a + b, 0);
+  if (sum > 0 && Math.abs(sum - 1) > 1e-6) {
+    for (let i = 0; i < live.length; i++) live[i] /= sum;
+  }
+  return live;
+}
+
+function normalizeProbVector(probs) {
+  const n = probs.length || 1;
+  const out = probs.map((p) => Math.max(1e-12, Number(p) || 0));
+  const sum = out.reduce((a, b) => a + b, 0);
+  if (sum <= 0) return out.map(() => 1 / n);
+  return out.map((p) => p / sum);
+}
+
+function softmaxScores(scores, beta = 1) {
+  const n = scores.length;
+  let maxS = -Infinity;
+  for (let i = 0; i < n; i++) if (scores[i] > maxS) maxS = scores[i];
+  const exps = new Array(n);
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const e = Math.exp(beta * (scores[i] - maxS));
+    exps[i] = e;
+    sum += e;
+  }
+  if (sum <= 0) return exps.map(() => 1 / n);
+  return exps.map((e) => e / sum);
+}
+
+/**
+ * Simple live odds:
+ *   P = 0.70 × P_model + 0.30 × P_centerline
+ * Centerline = softmax over arc-length progress along the track.
+ * Cash-out profit is capped on the API (min(stake, cashOut)) — keep this blend simple.
+ */
+function blendModelWithCenterline({
+  marbleBodies,
+  eliminated,
+  finished,
+  finishOrder,
+  modelProbs,
+  progressHints,
+}) {
+  const n = marbleBodies.length;
+  const first = finishOrder.length ? finishOrder[0] : -1;
+  if (first >= 0) {
+    const q = new Array(n).fill(1e-12);
+    q[first] = 1;
+    return normalizeProbVector(q);
+  }
+
+  const progress = new Array(n).fill(0);
+  const scores = new Array(n);
+
+  for (let i = 0; i < n; i++) {
+    if (eliminated[i] || finished[i] || !marbleBodies[i]) {
+      progress[i] = -1;
+      scores[i] = -1e6;
+      if (progressHints) progressHints[i] = -1;
+      continue;
+    }
+    const p = marbleBodies[i].translation();
+    const hint = progressHints?.[i] >= 0 ? progressHints[i] : null;
+    const proj = projectOntoCenterline(p.x, p.y, p.z, hint);
+    progress[i] = proj.progress;
+    if (progressHints) progressHints[i] = proj.progress;
+    // Softmax over progress — ~0.15 lead ≈ e^1 relative weight.
+    scores[i] = progress[i] / 0.15;
+  }
+
+  const pCenter = softmaxScores(scores, 1);
+  const pModel = normalizeProbVector(modelProbs || new Array(n).fill(1 / n));
+  const blended = pModel.map((pm, i) => 0.7 * pm + 0.3 * pCenter[i]);
+  return normalizeProbVector(blended);
 }
 
 function runPredictions(features) {
   if (!xgboostWinnerModel || !features) return null;
 
-  const probs = evaluateXGBoost(features, xgboostWinnerModel);
+  const expected =
+    Number(xgboostWinnerModel?.learner?.learner_model_param?.num_feature) ||
+    xgboostWinnerModel?.learner?.feature_names?.length ||
+    247;
+  if (features.length !== expected) {
+    console.warn(
+      `[Engine] Feature length mismatch: got ${features.length}, model expects ${expected}`,
+    );
+  }
+
+  const classProbs = evaluateXGBoost(features, xgboostWinnerModel);
+  const probs = probsToLiveOrder(classProbs);
   const maxProb = Math.max(...probs);
   const winnerId = probs.indexOf(maxProb);
 
@@ -168,6 +512,9 @@ export async function ensureInitialized() {
   if (!xgboostWinnerModel) {
     loadXGBoostModels();
   }
+  if (!trackCenterline) {
+    loadTrackCenterline();
+  }
 }
 
 // ── Autonomous Loading ──
@@ -195,8 +542,15 @@ export async function autoInitialize() {
 
 // ── Constants (matched to frontend) ──
 const OBSTACLE_SINK_DEPTH = 14;
-const OBSTACLE_SINK_TIME = 1.20;
-const OBSTACLE_HOLD_TIME = 0.28;
+// Transit times are fixed for every pebble — no per-obstacle compromise.
+const OBSTACLE_SINK_TIME = 2.0;
+const OBSTACLE_RISE_TIME = 2.0;
+// Brief dwell for normal pebbles so marbles don't sit stuck on raised pegs.
+const OBSTACLE_HOLD_TIME = 0.25;
+const OBSTACLE_WAIT_TIME = 0.25;
+// Finish-plane / spiral pebbles may linger longer at top/bottom.
+const OBSTACLE_HOLD_TIME_LONG = 2.5;
+const OBSTACLE_WAIT_TIME_LONG = 4.0;
 const PHYSICS_STEP = 1 / 120;
 const PHYSICS_HZ = 120;
 // Client playback multiplier (engine streams as fast as physics computes — no wall-clock sleep).
@@ -276,6 +630,18 @@ function marbleGridPos(m) {
   return { x: sp.x, y: sp.y, z: sp.z - 3.0 };
 }
 
+/** Fisher–Yates shuffle of start lanes (colors stay on marble index; only X lanes move). */
+function shuffleMarbleStarts(marbles, rng) {
+  const starts = marbles.map((m) => marbleGridPos(m));
+  for (let i = starts.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = starts[i];
+    starts[i] = starts[j];
+    starts[j] = tmp;
+  }
+  return starts;
+}
+
 async function yieldFramePace() {
   // No-op: the API pace-gate controls delivery timing.
   // The engine produces frames as fast as possible into the API's buffer.
@@ -297,8 +663,16 @@ export async function* streamRace(seed) {
   
   const obstacleRandom = mulberry32(seedNum + 12345);
   const marbleRandom = mulberry32(seedNum + 54321);
+  const laneRandom = mulberry32(seedNum + 77777);
 
   for (let i = 0; i < 7; i++) marbleRandom();
+
+  // Per-race lane order (provably tied to race seed). Metadata startPos alone is fixed.
+  const shuffledStarts = shuffleMarbleStarts(meta.marbles, laneRandom);
+  console.log(
+    `[Engine] Start lanes reshuffled:`,
+    shuffledStarts.map((p) => p.x.toFixed(1)).join(', '),
+  );
 
   let physicsWorld;
   if (warmedWorld) {
@@ -324,6 +698,14 @@ export async function* streamRace(seed) {
   const bladeBodies = meta.blades.map(b => getBody(b.handle));
   const gateBody = getBody(meta.handles.gate);
 
+  if (!meta.lastRunBB?.min || !meta.lastRunBB?.max) {
+    console.warn('[Engine] track-metadata.json has no lastRunBB — spiral buy-lock disabled until regions are extracted from the GLB');
+  } else {
+    console.log(
+      `[Engine] lastRunBB lock volume y=${meta.lastRunBB.min.y.toFixed(1)}..${meta.lastRunBB.max.y.toFixed(1)}`,
+    );
+  }
+
   function setRestitution(body, value) {
     if (!body) return;
     for (let j = 0; j < body.numColliders(); j++) {
@@ -335,13 +717,58 @@ export async function* streamRace(seed) {
   bladeBodies.forEach(b => setRestitution(b, 0.12));
   setRestitution(gateBody, 0.05);
 
+  // Place each marble on its reshuffled start lane before the first streamed frame.
+  for (let i = 0; i < marbleBodies.length; i++) {
+    const body = marbleBodies[i];
+    const sp = shuffledStarts[i];
+    if (!body || !sp) continue;
+    body.setTranslation(sp, true);
+    body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  }
+
   // Lower linear damping so marbles keep enough momentum to climb inclines
   marbleBodies.forEach(b => { if (b) b.setLinearDamping(0.01); });
 
-  const obsState = meta.obstacles.map(() => ({
-    timer: obstacleRandom() * 1.0 + 1.0,
-    state: 'waiting',
-  }));
+  function obstacleInBB(oMeta, bb, { yPad = 0 } = {}) {
+    if (!bb?.min || !bb?.max || !oMeta) return false;
+    return (
+      oMeta.wx >= bb.min.x && oMeta.wx <= bb.max.x &&
+      oMeta.bodyWy >= bb.min.y - yPad && oMeta.bodyWy <= bb.max.y + yPad &&
+      oMeta.wz >= bb.min.z && oMeta.wz <= bb.max.z
+    );
+  }
+
+  function isLongStayObstacle(oMeta) {
+    // Finish plane is a thin slab — pad Y so pegs sitting on it still match.
+    // lastRunBB covers the final spiral section.
+    return (
+      obstacleInBB(oMeta, meta.finishPlaneBB, { yPad: 25 }) ||
+      obstacleInBB(oMeta, meta.lastRunBB, { yPad: 10 })
+    );
+  }
+
+  function obstacleWaitTime(oMeta) {
+    return isLongStayObstacle(oMeta) ? OBSTACLE_WAIT_TIME_LONG : OBSTACLE_WAIT_TIME;
+  }
+
+  function obstacleHoldTime(oMeta) {
+    return isLongStayObstacle(oMeta) ? OBSTACLE_HOLD_TIME_LONG : OBSTACLE_HOLD_TIME;
+  }
+
+  // Desync start phases only — sink/rise always use the full 2s once entered.
+  const obsState = meta.obstacles.map((oMeta) => {
+    const rnd = obstacleRandom();
+    const waitT = obstacleWaitTime(oMeta);
+    const holdT = obstacleHoldTime(oMeta);
+    let state = 'waiting';
+    let timer = 0;
+    if (rnd < 0.25) { state = 'waiting'; timer = obstacleRandom() * waitT; }
+    else if (rnd < 0.5) { state = 'sinking'; timer = obstacleRandom() * OBSTACLE_SINK_TIME; }
+    else if (rnd < 0.75) { state = 'sunk'; timer = obstacleRandom() * holdT; }
+    else { state = 'rising'; timer = obstacleRandom() * OBSTACLE_RISE_TIME; }
+    return { timer, state };
+  });
 
   const trackForwardDir = new THREE.Vector3(meta.trackForwardDir.x, meta.trackForwardDir.y, meta.trackForwardDir.z);
 
@@ -355,13 +782,41 @@ export async function* streamRace(seed) {
   const finishedMarbles = [];
   const eliminated = meta.marbles.map(() => false);
   const finished = meta.marbles.map(() => false);
+  /** Finish order (first index = race winner for markets). */
+  const finishOrder = [];
   const fallTimer = meta.marbles.map(() => 0);
   const stuckTimer = meta.marbles.map(() => 0);
   const kickCooldown = meta.marbles.map(() => 0);
 
   // ── Prediction state ──
   const predictionHistory = [];
+  const centerlineProgressHints = meta.marbles.map(() => 0);
   let lastPredictions = null;
+  // Sticky: once any marble enters the mesh-derived last-run volume, lock buys.
+  let bettingLocked = false;
+
+  function pointInRegionBB(pos, bb, { yMaxPad = 0 } = {}) {
+    if (!bb?.min || !bb?.max) return false;
+    return (
+      pos.x >= bb.min.x && pos.x <= bb.max.x &&
+      pos.y >= bb.min.y && pos.y <= bb.max.y + yMaxPad &&
+      pos.z >= bb.min.z && pos.z <= bb.max.z
+    );
+  }
+
+  function anyMarbleInLastSpiral() {
+    if (!gateIsOpen) return false;
+    const bb = meta.lastRunBB;
+    if (!bb?.min || !bb?.max) return false;
+    for (let i = 0; i < marbleBodies.length; i++) {
+      const body = marbleBodies[i];
+      if (!body || eliminated[i] || finished[i]) continue;
+      // Same named-mesh AABB the track export derives (last + run). Slight
+      // roof pad matches camera spiral framing when approaching from above.
+      if (pointInRegionBB(body.translation(), bb, { yMaxPad: 10 })) return true;
+    }
+    return false;
+  }
 
   console.log(`[Engine] Setup complete. Yielding 'start' chunk at +${Date.now() - _startTime}ms`);
   yield {
@@ -374,7 +829,7 @@ export async function* streamRace(seed) {
     gateOpenTick: GATE_OPEN_TICK,
     impulseTick: IMPULSE_TICK,
     streamSpeed: STREAM_SPEED,
-    marbleStarts: meta.marbles.map((m) => marbleGridPos(m)),
+    marbleStarts: shuffledStarts,
   };
 
   const buildFrame = (tick, gateOpen) => ({
@@ -390,6 +845,7 @@ export async function* streamRace(seed) {
     obstacles: meta.obstacles.map((obs, i) => { const body = obstacleBodies[i]; return body ? body.translation().y : 0; }),
     blades: meta.blades.map((b, i) => { const body = bladeBodies[i]; if (!body) return [0, 0, 0, 1]; const r = body.rotation(); return [r.x, r.y, r.z, r.w]; }),
     gateIsOpen: gateOpen,
+    bettingLocked,
   });
 
   yield { type: 'frame', frame: buildFrame(0, false) };
@@ -444,7 +900,8 @@ export async function* streamRace(seed) {
       for (let i = 0; i < meta.obstacles.length; i++) {
         const obs = obsState[i];
         const body = obstacleBodies[i];
-        if (!body) continue;
+        const oMeta = meta.obstacles[i];
+        if (!body || !oMeta) continue;
 
         obs.timer -= PHYSICS_STEP;
         let sinkFrac = 0;
@@ -456,21 +913,20 @@ export async function* streamRace(seed) {
             break;
           case 'sinking':
             sinkFrac = 1 - obs.timer / OBSTACLE_SINK_TIME;
-            if (obs.timer <= 0) { obs.state = 'sunk'; obs.timer = OBSTACLE_HOLD_TIME; sinkFrac = 1; }
+            if (obs.timer <= 0) { obs.state = 'sunk'; obs.timer = obstacleHoldTime(oMeta); sinkFrac = 1; }
             break;
           case 'sunk':
             sinkFrac = 1;
-            if (obs.timer <= 0) { obs.state = 'rising'; obs.timer = OBSTACLE_SINK_TIME; }
+            if (obs.timer <= 0) { obs.state = 'rising'; obs.timer = OBSTACLE_RISE_TIME; }
             break;
           case 'rising':
-            sinkFrac = obs.timer / OBSTACLE_SINK_TIME;
-            if (obs.timer <= 0) { obs.state = 'waiting'; obs.timer = obstacleRandom() * 1.0 + 1.0; sinkFrac = 0; }
+            sinkFrac = obs.timer / OBSTACLE_RISE_TIME;
+            if (obs.timer <= 0) { obs.state = 'waiting'; obs.timer = obstacleWaitTime(oMeta); sinkFrac = 0; }
             break;
         }
 
         const s = sinkFrac * sinkFrac * (3 - 2 * sinkFrac);
         const sinkAmt = s * OBSTACLE_SINK_DEPTH;
-        const oMeta = meta.obstacles[i];
         body.setNextKinematicTranslation({ x: oMeta.wx, y: oMeta.bodyWy - sinkAmt, z: oMeta.wz });
       }
 
@@ -479,7 +935,8 @@ export async function* streamRace(seed) {
         const body = bladeBodies[i];
         if (!body || !blade.baseQuat) continue;
         const bq = blade.baseQuat;
-        _bladeRotOffset.setFromAxisAngle(_bladeAxis, physicsTimeTotal);
+        const randomPhase = blade.mesh ? (blade.mesh.id % 10) * 1.2 : i * 1.5;
+        _bladeRotOffset.setFromAxisAngle(_bladeAxis, physicsTimeTotal + randomPhase);
         _tempQ.set(bq.x, bq.y, bq.z, bq.w).multiply(_bladeRotOffset);
         body.setNextKinematicRotation({ x: _tempQ.x, y: _tempQ.y, z: _tempQ.z, w: _tempQ.w });
       }
@@ -490,7 +947,7 @@ export async function* streamRace(seed) {
     if (!gateIsOpen) {
       for (let i = 0; i < marbleBodies.length; i++) {
         const body = marbleBodies[i];
-        const grid = marbleGridPos(meta.marbles[i]);
+        const grid = shuffledStarts[i];
         if (!body || !grid || eliminated[i] || finished[i]) continue;
         body.setTranslation(grid, true);
         body.setLinvel({ x: 0, y: 0, z: 0 }, true);
@@ -592,7 +1049,10 @@ export async function* streamRace(seed) {
         isFinished = true;
       }
       
-      if (isFinished) finished[i] = true;
+      if (isFinished) {
+        finished[i] = true;
+        if (!finishOrder.includes(i)) finishOrder.push(i);
+      }
       
       const vel = body.linvel();
       if (vel.y < -110 && Math.abs(vel.x) < 40 && Math.abs(vel.z) < 40) fallTimer[i] += PHYSICS_STEP;
@@ -601,6 +1061,11 @@ export async function* streamRace(seed) {
         eliminated[i] = true;
         body.setTranslation({ x: 0, y: -1000, z: 0 }, true);
       }
+    }
+
+    if (!bettingLocked && anyMarbleInLastSpiral()) {
+      bettingLocked = true;
+      console.log(`[Engine] Betting locked — marble entered last spiral at tick ${physicsTick}`);
     }
 
     const frame = buildFrame(physicsTick, gateIsOpen);
@@ -614,7 +1079,7 @@ export async function* streamRace(seed) {
     // Yield event loop every 60 frames (~0.5s of sim time) to stay responsive.
     if (physicsTick % 60 === 0) await yieldEventLoop();
 
-    if (gateIsOpen && physicsTick % 60 === 0) {
+    if (gateIsOpen && physicsTick % PRED_SAMPLE_INTERVAL === 0) {
       const snapFrame = meta.marbles.map((m, i) => {
         const body = marbleBodies[i];
         if (!body || eliminated[i] || finished[i]) return { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
@@ -623,10 +1088,33 @@ export async function* streamRace(seed) {
         return { x: p.x, y: p.y, z: p.z, vx: v.x, vy: v.y, vz: v.z };
       });
       predictionHistory.push(snapFrame);
-      if (predictionHistory.length > 15) predictionHistory.shift();
+      if (predictionHistory.length > PRED_HISTORY_LEN) predictionHistory.shift();
 
-      const features = buildPredictorFeatures(predictionHistory, physicsTick);
-      lastPredictions = runPredictions(features);
+      const raceStartTick = gateOpenTick > 0 ? gateOpenTick : 0;
+      const features = buildPredictorFeatures(
+        predictionHistory,
+        physicsTick,
+        raceStartTick,
+      );
+      const rawPred = runPredictions(features);
+      if (rawPred?.[0]?.probabilities) {
+        const blended = blendModelWithCenterline({
+          marbleBodies,
+          eliminated,
+          finished,
+          finishOrder,
+          modelProbs: rawPred[0].probabilities,
+          progressHints: centerlineProgressHints,
+        });
+        const maxProb = Math.max(...blended);
+        lastPredictions = [{
+          probabilities: blended,
+          confidence: maxProb,
+          winner_id: blended.indexOf(maxProb),
+        }];
+      } else {
+        lastPredictions = rawPred;
+      }
     }
     
     let activeCount = 0;

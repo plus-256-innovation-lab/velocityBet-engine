@@ -6,20 +6,21 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
   app.enableCors({
-    origin: [
-      'http://localhost:5173',
-      'http://127.0.0.1:5173',
-      'http://localhost:5180',
-      'http://127.0.0.1:5180',
-      'http://localhost:5181',
-      'http://127.0.0.1:5181',
-      'https://localhost',
-      'http://localhost',
-      'capacitor://localhost',
-      'ionic://localhost',
-      'https://velocitybet-frontend-408537014080.us-central1.run.app',
-      'https://velocitybet-v1-408537014080.us-central1.run.app',
-    ],
+    origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+      if (!origin || origin.includes('localhost') || origin.includes('127.0.0.1')) {
+        callback(null, true);
+      } else {
+        const allowed = [
+          'https://velocitybet-frontend-408537014080.us-central1.run.app',
+          'https://velocitybet-v1-408537014080.us-central1.run.app',
+        ];
+        if (allowed.includes(origin)) {
+          callback(null, true);
+        } else {
+          callback(new Error('Not allowed by CORS'));
+        }
+      }
+    },
     credentials: true,
     methods: 'OPTIONS, POST, GET',
     allowedHeaders: 'Content-Type, Authorization',

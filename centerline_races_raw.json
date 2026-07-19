@@ -1,0 +1,65 @@
+{
+  "generatedAt": "2026-07-18T07:26:47.750Z",
+  "method": "Track ALL marble positions every frame from gate-open. When the first marble finishes, keep only that marble’s continuous path (progress 0→1). Multi-race: average those first-finisher paths.",
+  "races": [
+    {
+      "seed": 10000,
+      "firstFinisherId": 4,
+      "firstFinisherName": "Cyan",
+      "gateOpenTick": 540,
+      "firstFinishTick": 22438,
+      "durationTicks": 21898,
+      "firstFinisherSampleCount": 21899,
+      "allPathCounts": [
+        {
+          "marbleIndex": 0,
+          "name": "Green",
+          "samples": 21899,
+          "finishedAt": null
+        },
+        {
+          "marbleIndex": 1,
+          "name": "Blue",
+          "samples": 21899,
+          "finishedAt": null
+        },
+        {
+          "marbleIndex": 2,
+          "name": "Yellow",
+          "samples": 21899,
+          "finishedAt": null
+        },
+        {
+          "marbleIndex": 3,
+          "name": "White",
+          "samples": 21899,
+          "finishedAt": null
+        },
+        {
+          "marbleIndex": 4,
+          "name": "Cyan",
+          "samples": 21899,
+          "finishedAt": 22438
+        },
+        {
+          "marbleIndex": 5,
+          "name": "Purple",
+          "samples": 21899,
+          "finishedAt": null
+        },
+        {
+          "marbleIndex": 6,
+          "name": "Orange",
+          "samples": 21899,
+          "finishedAt": null
+        },
+        {
+          "marbleIndex": 7,
+          "name": "Black",
+          "samples": 21899,
+          "finishedAt": null
+        }
+      ]
+    }
+  ]
+}

@@ -12,4 +12,6 @@ dist/
 
 # Training/dev artifacts not needed in the container (huge — slows uploads)
 track-snapshot.bin
+track-v1.glb
+track-version.json
 marble_race_data.csv
